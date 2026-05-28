@@ -1,5 +1,6 @@
 """
-parser.py — analyzes + auto-summarizes 8-K filings using Groq (free)
+parser.py — analyzes + auto-summarizes 8-K filings using Gemini (free)
+Rate-limited to stay within Gemini free tier (15 req/min)
 """
 
 from keywords   import BULLISH, BEARISH, ITEM_LABELS
@@ -7,14 +8,17 @@ from summarizer import summarize_filing, GEMINI_API_KEY
 
 
 def analyze_filings(filings):
-    results    = []
-    use_groq   = bool(GEMINI_API_KEY)
-    total      = len(filings)
+    results  = []
+    total    = len(filings)
+    use_ai   = bool(GEMINI_API_KEY)
 
-    if use_groq:
-        print(f"   🤖 Auto-summarizing with Gemini (free) for {total} filings...")
+    if use_ai:
+        with_text = sum(1 for f in filings if f.get("text"))
+        print(f"   🤖 Gemini will summarize ~{with_text} filings (4s gap between calls)")
+        print(f"      Estimated time: ~{with_text * 4 // 60}m {with_text * 4 % 60}s")
     else:
-        print(f"   ⚠️  No GEMINI_API_KEY found — skipping summaries. Add it to .env for free Gemini summaries.")
+        print(f"   ⚠️  GEMINI_API_KEY not set — keyword scoring only, no summaries")
+        print(f"      Add GEMINI_API_KEY to .env for free AI summaries")
 
     for i, filing in enumerate(filings, 1):
         text_lower = filing.get("text", "").lower()
@@ -23,7 +27,7 @@ def analyze_filings(filings):
         ticker     = filing.get("ticker", "N/A")
         filed_at   = filing.get("filed_at", "")
 
-        # ── Keyword scoring ───────────────────────────────────────────
+        # ── Keyword scoring ───────────────────────────────────────
         bullish_hits = {}
         bearish_hits = {}
         total_score  = 0
@@ -38,7 +42,7 @@ def analyze_filings(filings):
                 bearish_hits[kw] = score
                 total_score += score
 
-        # ── Signal ────────────────────────────────────────────────────
+        # ── Signal ────────────────────────────────────────────────
         if total_score >= 15:
             signal, color = "STRONG BUY",       "#0a7c42"
         elif total_score >= 7:
@@ -54,7 +58,7 @@ def analyze_filings(filings):
         else:
             signal, color = "NEUTRAL",          "#7f8c8d"
 
-        # ── Item summaries ────────────────────────────────────────────
+        # ── Item summaries ────────────────────────────────────────
         item_summaries = {}
         for item_num in filing.get("items", []):
             item_str  = str(item_num)
@@ -65,9 +69,9 @@ def analyze_filings(filings):
                 "text" : item_text,
             }
 
-        # ── Auto-summarize via Groq (free) ────────────────────────────
+        # ── Gemini summary ─────────────────────────────────────────
         ai_summary = ""
-        if use_groq and filing.get("text") and item_summaries:
+        if use_ai and filing.get("text") and item_summaries:
             ai_summary = summarize_filing(
                 company, ticker, filed_at,
                 item_summaries, bullish_hits, bearish_hits
@@ -90,7 +94,7 @@ def analyze_filings(filings):
             "has_text"      : bool(filing.get("text", "")),
         })
 
-        if i % 10 == 0:
+        if i % 25 == 0:
             print(f"   📊 Processed {i}/{total} filings...")
 
     results.sort(key=lambda x: x["score"], reverse=True)
