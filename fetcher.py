@@ -72,11 +72,19 @@ def fetch_todays_8k_filings(days_back=1, max_filings=200):
                 if m_company:
                     company = m_company.group(1).strip()
 
-                # Extract first ticker — first word inside first ()
-                m_ticker = re.search(r'\(([^C][^I][^K][^)]+)\)', name_str)
-                if m_ticker:
-                    # Could be "H" or "REG, REGCO, REGCP" — take first
-                    ticker = m_ticker.group(1).split(",")[0].strip()
+                # Extract ticker — find all (...) groups, skip the (CIK ...) one
+                # "Hyatt Hotels Corp  (H)  (CIK 0001468174)"     → H
+                # "Regency Centers Corp  (REG, REGCO)  (CIK...)" → REG
+                # "Fidelity Private Credit Fund  (CIK ...)"      → N/A
+                all_parens = re.findall(r'\(([^)]+)\)', name_str)
+                for group in all_parens:
+                    group = group.strip()
+                    if group.upper().startswith("CIK"):
+                        continue
+                    first = group.split(",")[0].strip()
+                    if re.match(r'^[A-Z][A-Z0-9\-\.]{0,8}$', first):
+                        ticker = first
+                        break
 
             # ── Build filing index URL ─────────────────────────────────
             # URL format: /Archives/edgar/data/{cik}/{adsh_no_dashes}/{adsh}-index.htm
