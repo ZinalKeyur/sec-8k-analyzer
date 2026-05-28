@@ -78,9 +78,6 @@ def generate_html(results, path, today):
 
         text_status = '<span class="no-text">⚠️ text not fetched</span>' if not r["has_text"] else ""
 
-            .replace("&","&amp;").replace('"',"&quot;")
-            .replace("'","&#39;").replace("<","&lt;").replace(">","&gt;"))
-
         idx_plus_1 = idx + 1
 
         # AI summary block (shown directly in table if Gemini key is set)
