@@ -1,61 +1,33 @@
 """
-fetcher.py
-==========
-Downloads all 8-K filings from SEC EDGAR using the official EDGAR REST API.
-No API key needed. Free.
+fetcher.py — SEC EDGAR 8-K fetcher
 """
 
 import requests
 import re
 import time
-import json
 from datetime import date, timedelta
 
 HEADERS = {
-    "User-Agent": "8K-Analyzer your@email.com",  # SEC requires real contact info
-    "Accept"    : "application/json",
+    "User-Agent": "8K-Analyzer your@email.com",
+    "Accept-Encoding": "gzip, deflate",
 }
 
-EDGAR_FULL_TEXT  = "https://efts.sec.gov/LATEST/search-index"
-EDGAR_BROWSE     = "https://www.sec.gov/cgi-bin/browse-edgar"
+EDGAR_SEARCH_URL = "https://efts.sec.gov/LATEST/search-index"
 EDGAR_BASE_URL   = "https://www.sec.gov"
-SUBMISSIONS_URL  = "https://data.sec.gov/submissions"
 
 
 def fetch_todays_8k_filings(days_back=1, max_filings=200):
-    """
-    Fetch all 8-K filings from the last N days.
-    Uses EDGAR full-text search + submissions API for company/ticker data.
-    """
     today     = date.today()
     from_date = (today - timedelta(days=days_back)).strftime("%Y-%m-%d")
     to_date   = today.strftime("%Y-%m-%d")
 
     print(f"   🔍 Searching EDGAR: {from_date} → {to_date}")
 
-    # Step 1: get filing list from full-text search
-    raw_filings = get_filing_list(from_date, to_date, max_filings)
-    print(f"   📋 Raw filings found: {len(raw_filings)}")
+    all_filings = []
+    start = 0
+    batch = 40
 
-    # Step 2: enrich each filing with company info + text
-    enriched = []
-    for i, f in enumerate(raw_filings, 1):
-        filing = enrich_filing(f)
-        enriched.append(filing)
-        if i % 25 == 0:
-            print(f"   ⏳ Enriched {i}/{len(raw_filings)} filings...")
-        time.sleep(0.12)  # respect SEC rate limit
-
-    return enriched
-
-
-def get_filing_list(from_date, to_date, max_filings):
-    """Get list of 8-K filings from EDGAR search."""
-    filings = []
-    start   = 0
-    batch   = 40
-
-    while len(filings) < max_filings:
+    while len(all_filings) < max_filings:
         params = {
             "forms"    : "8-K",
             "dateRange": "custom",
@@ -65,14 +37,11 @@ def get_filing_list(from_date, to_date, max_filings):
             "size"     : batch,
         }
         try:
-            resp = requests.get(
-                EDGAR_FULL_TEXT, params=params,
-                headers=HEADERS, timeout=15
-            )
+            resp  = requests.get(EDGAR_SEARCH_URL, params=params, headers=HEADERS, timeout=15)
             resp.raise_for_status()
-            data = resp.json()
+            data  = resp.json()
         except Exception as e:
-            print(f"   ❌ Search API error at offset {start}: {e}")
+            print(f"   ❌ Search error at offset {start}: {e}")
             break
 
         hits  = data.get("hits", {}).get("hits", [])
@@ -81,122 +50,92 @@ def get_filing_list(from_date, to_date, max_filings):
         if not hits:
             break
 
-        print(f"   📥 Got batch {start}–{start+len(hits)} of {total} total...")
+        print(f"   📥 Fetched batch {start}–{start+len(hits)} (total: {total})...")
 
         for hit in hits:
-            src = hit.get("_source", {})
-            filings.append({
-                "_id"        : hit.get("_id", ""),
-                "source"     : src,
-            })
+            src  = hit.get("_source", {})
+            adsh = src.get("adsh", "")          # e.g. "0001104659-26-067209"
+            ciks = src.get("ciks", [])
+            cik  = ciks[0].lstrip("0") if ciks else ""   # strip leading zeros for URL
+
+            # ── Parse display_names string ─────────────────────────────
+            # Format: "Hyatt Hotels Corp  (H)  (CIK 0001468174)"
+            # or with multiple tickers: "Regency Centers Corp  (REG, REGCO)  (CIK 0000910606)"
+            company = "Unknown"
+            ticker  = "N/A"
+            raw_names = src.get("display_names", [])
+
+            if raw_names:
+                name_str = raw_names[0] if isinstance(raw_names, list) else raw_names
+                # Extract company name — everything before the first (
+                m_company = re.match(r'^([^(]+)', name_str)
+                if m_company:
+                    company = m_company.group(1).strip()
+
+                # Extract first ticker — first word inside first ()
+                m_ticker = re.search(r'\(([^C][^I][^K][^)]+)\)', name_str)
+                if m_ticker:
+                    # Could be "H" or "REG, REGCO, REGCP" — take first
+                    ticker = m_ticker.group(1).split(",")[0].strip()
+
+            # ── Build filing index URL ─────────────────────────────────
+            # URL format: /Archives/edgar/data/{cik}/{adsh_no_dashes}/{adsh}-index.htm
+            adsh_no_dashes = adsh.replace("-", "")
+            if cik and adsh:
+                index_url = (
+                    f"{EDGAR_BASE_URL}/Archives/edgar/data/{cik}"
+                    f"/{adsh_no_dashes}/{adsh}-index.htm"
+                )
+            else:
+                index_url = ""
+
+            filing = {
+                "ticker"    : ticker,
+                "company"   : company,
+                "cik"       : cik,
+                "filed_at"  : src.get("file_date", ""),
+                "form_type" : src.get("form_type", src.get("file_type", "8-K")),
+                "filing_url": index_url,
+                "doc_url"   : "",
+                "text"      : "",
+                "items"     : src.get("items", []),
+                "location"  : src.get("biz_locations", [""])[0] if src.get("biz_locations") else "",
+            }
+
+            # Fetch actual filing text
+            text, doc_url = fetch_filing_text(index_url, cik, adsh_no_dashes, adsh)
+            filing["text"]    = text
+            filing["doc_url"] = doc_url
+
+            all_filings.append(filing)
+            time.sleep(0.1)
 
         start += batch
         if start >= total or start >= max_filings:
             break
 
-    return filings
+    return all_filings
 
 
-def enrich_filing(raw):
+def fetch_filing_text(index_url, cik, adsh_no_dashes, adsh):
     """
-    Given a raw hit from EDGAR search, extract all useful fields.
-    Tries multiple field name variants since EDGAR API field names vary.
-    """
-    src = raw.get("source", {})
-    _id = raw.get("_id", "")
-
-    # ── COMPANY NAME ──────────────────────────────────────────────────────
-    # Try every known field name EDGAR uses
-    company = (
-        src.get("entity_name") or
-        src.get("display_names", [{}])[0].get("name", "") if src.get("display_names") else "" or
-        src.get("company_name") or
-        src.get("name") or
-        "Unknown"
-    )
-    # display_names is a list of dicts like [{"name": "Apple Inc", "ticker": "AAPL"}]
-    display_names = src.get("display_names", [])
-    if display_names and isinstance(display_names, list):
-        first = display_names[0]
-        if isinstance(first, dict):
-            company = first.get("name", company)
-
-    # ── TICKER ────────────────────────────────────────────────────────────
-    ticker = "N/A"
-    # Try display_names first (most reliable)
-    if display_names and isinstance(display_names, list):
-        first = display_names[0]
-        if isinstance(first, dict) and first.get("ticker"):
-            ticker = first.get("ticker")
-    # Fallback to tickers list
-    if ticker == "N/A":
-        tickers_list = src.get("tickers", [])
-        if tickers_list:
-            ticker = tickers_list[0]
-
-    # ── CIK ───────────────────────────────────────────────────────────────
-    ciks = src.get("ciks", []) or src.get("cik", [])
-    cik  = ciks[0] if ciks else ""
-    if not cik and display_names:
-        first = display_names[0]
-        if isinstance(first, dict):
-            cik = str(first.get("cik", ""))
-
-    # ── ACCESSION / URLS ──────────────────────────────────────────────────
-    accession    = _id.replace("-", "")
-    index_href   = src.get("file_index_href", "")
-    filing_url   = (EDGAR_BASE_URL + index_href) if index_href else ""
-
-    # ── DATES ─────────────────────────────────────────────────────────────
-    filed_at = (
-        src.get("file_date") or
-        src.get("period_of_report") or
-        src.get("filed") or ""
-    )
-
-    # ── ITEMS ─────────────────────────────────────────────────────────────
-    items = src.get("items", []) or src.get("form_items", [])
-
-    # ── TEXT ──────────────────────────────────────────────────────────────
-    text, doc_url = fetch_filing_text(filing_url, cik, accession)
-
-    return {
-        "ticker"     : ticker,
-        "company"    : company,
-        "cik"        : cik,
-        "filed_at"   : filed_at,
-        "form_type"  : src.get("form_type", "8-K"),
-        "filing_url" : filing_url,
-        "doc_url"    : doc_url,
-        "text"       : text,
-        "items"      : items,
-    }
-
-
-def fetch_filing_text(index_url, cik, accession):
-    """
-    Try to get the actual filing text.
+    Fetch the actual 8-K document text.
     Returns (text, doc_url). Never crashes.
     """
-    # Strategy 1 — parse the index page HTML for the primary document link
+    # Strategy 1 — parse the index page to find the primary .htm document
     if index_url:
         try:
             resp = requests.get(index_url, headers=HEADERS, timeout=10)
             resp.raise_for_status()
-            # Find .htm links in the index page (exclude index files themselves)
+            # Find .htm links that are NOT the index itself
             links = re.findall(
                 r'href="(/Archives/edgar/data/[^"]+\.htm)"',
                 resp.text, re.IGNORECASE
             )
             links = [l for l in links if "index" not in l.lower()]
-            if not links:
-                links = re.findall(
-                    r'href="(/Archives/edgar/data/[^"]+\.txt)"',
-                    resp.text, re.IGNORECASE
-                )
             if links:
                 doc_url  = EDGAR_BASE_URL + links[0]
-                doc_resp = requests.get(doc_url, headers=HEADERS, timeout=10)
+                doc_resp = requests.get(doc_url, headers=HEADERS, timeout=12)
                 doc_resp.raise_for_status()
                 text = strip_html(doc_resp.text)
                 if len(text) > 200:
@@ -204,23 +143,10 @@ def fetch_filing_text(index_url, cik, accession):
         except Exception:
             pass
 
-    # Strategy 2 — EDGAR submissions API for company info fallback
-    if cik:
+    # Strategy 2 — try the raw .txt full submission file
+    if cik and adsh:
         try:
-            cik_padded = str(cik).zfill(10)
-            url  = f"{SUBMISSIONS_URL}/CIK{cik_padded}.json"
-            resp = requests.get(url, headers=HEADERS, timeout=10)
-            if resp.status_code == 200:
-                # We at least have company data — text not available via this endpoint
-                pass
-        except Exception:
-            pass
-
-    # Strategy 3 — direct .txt filing URL
-    if cik and accession and len(accession) >= 18:
-        try:
-            acc_fmt  = f"{accession[:10]}-{accession[10:12]}-{accession[12:]}"
-            txt_url  = f"{EDGAR_BASE_URL}/Archives/edgar/data/{cik}/{accession}/{acc_fmt}.txt"
+            txt_url  = f"{EDGAR_BASE_URL}/Archives/edgar/data/{cik}/{adsh_no_dashes}/{adsh}.txt"
             resp     = requests.get(txt_url, headers=HEADERS, timeout=10)
             if resp.status_code == 200:
                 text = strip_html(resp.text)
@@ -232,9 +158,8 @@ def fetch_filing_text(index_url, cik, accession):
     return "", ""
 
 
-def strip_html(html_text):
-    """Remove HTML tags and collapse whitespace."""
-    text = re.sub(r'<[^>]+>', ' ', html_text)
+def strip_html(html):
+    text = re.sub(r'<[^>]+>', ' ', html)
     text = re.sub(r'&nbsp;', ' ', text)
     text = re.sub(r'&amp;',  '&', text)
     text = re.sub(r'&lt;',   '<', text)
