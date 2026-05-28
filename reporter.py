@@ -105,6 +105,21 @@ def generate_html(results, path, today):
             .replace("'","&#39;").replace("<","&lt;").replace(">","&gt;"))
 
         idx_plus_1 = idx + 1
+
+        # AI summary block (shown directly in table if Gemini key is set)
+        raw_ai = r.get("ai_summary", "")
+        if raw_ai:
+            safe_ai = (raw_ai
+                .replace("&","&amp;").replace("<","&lt;")
+                .replace(">","&gt;").replace('"',"&quot;"))
+            ai_summary_html = (
+                f'<div class="gemini-summary">'
+                f'<span class="gemini-label">✨ Gemini Summary</span>'
+                f'<pre>{safe_ai}</pre>'
+                f'</div>'
+            )
+        else:
+            ai_summary_html = 
         score_sign = f'+{r["score"]}' if r["score"] > 0 else str(r["score"])
 
         # ── Links ──────────────────────────────────────────────────
@@ -115,8 +130,6 @@ def generate_html(results, path, today):
             links += f'<a href="{r["filing_url"]}" target="_blank">🗂 Index</a>'
 
         # ── Summary paste area ─────────────────────────────────────
-        sum_id   = f"summary_{idx}"
-        paste_id = f"paste_{idx}"
         rows_html += f"""
         <tr data-signal="{r['signal']}" data-score="{r['score']}"
             data-filed="{r['filed_at']}" data-has-text="{'1' if r['has_text'] else '0'}"
@@ -133,21 +146,14 @@ def generate_html(results, path, today):
             {items_html}
             {text_status}
             {detail_html}
+            {ai_summary_html}
           </td>
           <td>
             {links}
-            <div style="margin-top:6px;display:flex;gap:4px;flex-wrap:wrap">
+            <div style="margin-top:6px">
               <button class="claude-btn" onclick="openInClaude(this)"
-                data-prompt="{claude_prompt}">🤖 Summarize</button>
-              <button class="paste-btn" onclick="showPaste('{sum_id}','{paste_id}')">📋 Paste</button>
+                data-prompt="{claude_prompt}">🤖 Summarize in Claude</button>
             </div>
-            <div id="{paste_id}" style="display:none;margin-top:6px">
-              <textarea rows="4" style="width:100%;font-size:11px;padding:4px"
-                placeholder="Paste Claude summary here..."></textarea>
-              <button style="font-size:10px;padding:2px 8px;margin-top:3px"
-                onclick="saveSummary('{sum_id}','{paste_id}')">✅ Show in table</button>
-            </div>
-            <div id="{sum_id}" class="ai-summary-block" style="display:none"></div>
           </td>
         </tr>
         """
@@ -211,6 +217,11 @@ tbody td{{padding:8px 11px;vertical-align:top}}
               border-radius:0 6px 6px 0;font-size:11px;max-width:560px}}
 .item-detail strong{{font-size:12px;display:block;margin-bottom:5px;color:#0d47a1}}
 .raw-text p{{color:#333;font-size:11px;line-height:1.5;white-space:pre-wrap;word-break:break-word}}
+.gemini-summary{{margin-top:8px;padding:10px 12px;background:#f0fdf4;
+  border-left:3px solid #10b981;border-radius:0 6px 6px 0;max-width:580px}}
+.gemini-label{{font-size:10px;font-weight:600;color:#059669;display:block;margin-bottom:6px}}
+.gemini-summary pre{{font-family:inherit;font-size:11px;color:#1f2937;
+  line-height:1.6;white-space:pre-wrap;word-break:break-word}}
 
 .no-text{{font-size:10px;color:#e67e22}}
 
@@ -218,17 +229,6 @@ tbody td{{padding:8px 11px;vertical-align:top}}
              background:#7c3aed;color:white;border:none;
              border-radius:6px;cursor:pointer;white-space:nowrap}}
 .claude-btn:hover{{background:#6d28d9}}
-.paste-btn{{padding:4px 9px;font-size:11px;font-weight:500;
-            background:#0ea5e9;color:white;border:none;
-            border-radius:6px;cursor:pointer;white-space:nowrap}}
-.paste-btn:hover{{background:#0284c7}}
-
-.ai-summary-block{{
-  margin-top:8px;padding:10px 12px;
-  background:#f0fdf4;border-left:3px solid #0a7c42;
-  border-radius:0 6px 6px 0;font-size:12px;
-  line-height:1.6;max-width:560px;white-space:pre-wrap;word-break:break-word
-}}
 
 .links a{{color:#3498db;text-decoration:none;margin-right:6px;font-size:11px}}
 .links a:hover{{text-decoration:underline}}
@@ -418,22 +418,6 @@ function toggleDetail(id) {{
 function openInClaude(btn) {{
   const prompt = btn.getAttribute('data-prompt');
   window.open('https://claude.ai/new?q=' + encodeURIComponent(prompt), '_blank');
-}}
-
-// ── Paste summary back into table ─────────────────────────────────────────
-function showPaste(sumId, pasteId) {{
-  const el = document.getElementById(pasteId);
-  if (el) el.style.display = el.style.display === 'none' ? 'block' : 'none';
-}}
-
-function saveSummary(sumId, pasteId) {{
-  const pasteDiv = document.getElementById(pasteId);
-  const summDiv  = document.getElementById(sumId);
-  const ta       = pasteDiv.querySelector('textarea');
-  if (!ta || !ta.value.trim()) return;
-  summDiv.textContent = ta.value.trim();
-  summDiv.style.display = 'block';
-  pasteDiv.style.display = 'none';
 }}
 
 // ── Init ──────────────────────────────────────────────────────────────────
