@@ -1,0 +1,12 @@
+# .env — rename this file to .env and fill in your values
+
+CONCUR_EMAIL=your.name@redhat.com
+CONCUR_PASSWORD=your_concur_password_here
+
+# Claude API key for 8-K AI summaries
+# Get one free at: https://console.anthropic.com
+ANTHROPIC_API_KEY=your_claude_api_key_here
+
+# Gemini API key for FREE auto-summaries
+# Get free key (no credit card): https://aistudio.google.com/app/apikey
+GEMINI_API_KEY=AIzaSyDgiW3MPDHdhzTkDOQMm-a_gYIeM0OA2Nc
