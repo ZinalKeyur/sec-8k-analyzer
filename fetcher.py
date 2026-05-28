@@ -1,5 +1,5 @@
 """
-fetcher.py — SEC EDGAR 8-K fetcher
+fetcher.py — SEC EDGAR 8-K fetcher with robust text extraction
 """
 
 import requests
@@ -54,28 +54,20 @@ def fetch_todays_8k_filings(days_back=1, max_filings=200):
 
         for hit in hits:
             src  = hit.get("_source", {})
-            adsh = src.get("adsh", "")          # e.g. "0001104659-26-067209"
+            adsh = src.get("adsh", "")
             ciks = src.get("ciks", [])
-            cik  = ciks[0].lstrip("0") if ciks else ""   # strip leading zeros for URL
+            cik  = ciks[0].lstrip("0") if ciks else ""
 
             # ── Parse display_names string ─────────────────────────────
-            # Format: "Hyatt Hotels Corp  (H)  (CIK 0001468174)"
-            # or with multiple tickers: "Regency Centers Corp  (REG, REGCO)  (CIK 0000910606)"
-            company = "Unknown"
-            ticker  = "N/A"
+            company   = "Unknown"
+            ticker    = "N/A"
             raw_names = src.get("display_names", [])
 
             if raw_names:
                 name_str = raw_names[0] if isinstance(raw_names, list) else raw_names
-                # Extract company name — everything before the first (
-                m_company = re.match(r'^([^(]+)', name_str)
-                if m_company:
-                    company = m_company.group(1).strip()
-
-                # Extract ticker — find all (...) groups, skip the (CIK ...) one
-                # "Hyatt Hotels Corp  (H)  (CIK 0001468174)"     → H
-                # "Regency Centers Corp  (REG, REGCO)  (CIK...)" → REG
-                # "Fidelity Private Credit Fund  (CIK ...)"      → N/A
+                m = re.match(r'^([^(]+)', name_str)
+                if m:
+                    company = m.group(1).strip()
                 all_parens = re.findall(r'\(([^)]+)\)', name_str)
                 for group in all_parens:
                     group = group.strip()
@@ -87,33 +79,41 @@ def fetch_todays_8k_filings(days_back=1, max_filings=200):
                         break
 
             # ── Build filing index URL ─────────────────────────────────
-            # URL format: /Archives/edgar/data/{cik}/{adsh_no_dashes}/{adsh}-index.htm
             adsh_no_dashes = adsh.replace("-", "")
+            index_url = ""
+            doc_hint  = hit.get("_id", "")   # e.g. "0000051143-26-000047:ibm-20260528.htm"
+            hint_file = doc_hint.split(":")[-1] if ":" in doc_hint else ""
+
             if cik and adsh:
                 index_url = (
                     f"{EDGAR_BASE_URL}/Archives/edgar/data/{cik}"
                     f"/{adsh_no_dashes}/{adsh}-index.htm"
                 )
-            else:
-                index_url = ""
 
             filing = {
                 "ticker"    : ticker,
                 "company"   : company,
                 "cik"       : cik,
                 "filed_at"  : src.get("file_date", ""),
-                "form_type" : src.get("form_type", src.get("file_type", "8-K")),
+                "form_type" : src.get("file_type", "8-K"),
                 "filing_url": index_url,
                 "doc_url"   : "",
                 "text"      : "",
+                "item_texts": {},
                 "items"     : src.get("items", []),
                 "location"  : src.get("biz_locations", [""])[0] if src.get("biz_locations") else "",
             }
 
-            # Fetch actual filing text
-            text, doc_url = fetch_filing_text(index_url, cik, adsh_no_dashes, adsh)
+            # Try direct document URL first using the hint from _id
+            text, doc_url = fetch_filing_text(
+                cik, adsh_no_dashes, adsh, hint_file, index_url
+            )
             filing["text"]    = text
             filing["doc_url"] = doc_url
+
+            # Parse item sections from text
+            if text:
+                filing["item_texts"] = extract_item_sections(text)
 
             all_filings.append(filing)
             time.sleep(0.1)
@@ -125,17 +125,31 @@ def fetch_todays_8k_filings(days_back=1, max_filings=200):
     return all_filings
 
 
-def fetch_filing_text(index_url, cik, adsh_no_dashes, adsh):
+def fetch_filing_text(cik, adsh_no_dashes, adsh, hint_file, index_url):
     """
-    Fetch the actual 8-K document text.
-    Returns (text, doc_url). Never crashes.
+    Try multiple strategies to get full filing text.
+    Returns (text, doc_url).
     """
-    # Strategy 1 — parse the index page to find the primary .htm document
+
+    # Strategy 1 — use the _id hint to go directly to the primary document
+    # _id format: "0000051143-26-000047:ibm-20260528.htm"
+    if cik and adsh_no_dashes and hint_file:
+        try:
+            doc_url  = f"{EDGAR_BASE_URL}/Archives/edgar/data/{cik}/{adsh_no_dashes}/{hint_file}"
+            resp     = requests.get(doc_url, headers=HEADERS, timeout=12)
+            if resp.status_code == 200:
+                text = strip_html(resp.text)
+                if len(text) > 300:
+                    return text[:50000], doc_url
+        except Exception:
+            pass
+
+    # Strategy 2 — parse the index page and find primary htm document
     if index_url:
         try:
             resp = requests.get(index_url, headers=HEADERS, timeout=10)
             resp.raise_for_status()
-            # Find .htm links that are NOT the index itself
+            # Find all .htm links, skip index files
             links = re.findall(
                 r'href="(/Archives/edgar/data/[^"]+\.htm)"',
                 resp.text, re.IGNORECASE
@@ -146,31 +160,58 @@ def fetch_filing_text(index_url, cik, adsh_no_dashes, adsh):
                 doc_resp = requests.get(doc_url, headers=HEADERS, timeout=12)
                 doc_resp.raise_for_status()
                 text = strip_html(doc_resp.text)
-                if len(text) > 200:
-                    return text[:20000], doc_url
+                if len(text) > 300:
+                    return text[:50000], doc_url
         except Exception:
             pass
 
-    # Strategy 2 — try the raw .txt full submission file
+    # Strategy 3 — full submission .txt file
     if cik and adsh:
         try:
             txt_url  = f"{EDGAR_BASE_URL}/Archives/edgar/data/{cik}/{adsh_no_dashes}/{adsh}.txt"
-            resp     = requests.get(txt_url, headers=HEADERS, timeout=10)
+            resp     = requests.get(txt_url, headers=HEADERS, timeout=12)
             if resp.status_code == 200:
                 text = strip_html(resp.text)
-                if len(text) > 200:
-                    return text[:20000], txt_url
+                if len(text) > 300:
+                    return text[:50000], txt_url
         except Exception:
             pass
 
     return "", ""
 
 
+def extract_item_sections(text):
+    """
+    Parse the filing text and extract each Item section.
+    Returns dict like:
+    {
+      "7.01": "Item 7.01. Regulation FD Disclosure. The information...",
+      "8.01": "Item 8.01. Other Events. ...",
+    }
+    """
+    items = {}
+
+    # Find all "Item X.XX" occurrences and split text at each
+    pattern = r'(Item\s+(\d+\.\d+)[^\n]*(?:\n|\.)[^\n]*)'
+    splits  = re.split(r'(?=Item\s+\d+\.\d+)', text, flags=re.IGNORECASE)
+
+    for chunk in splits:
+        m = re.match(r'Item\s+(\d+\.\d+)', chunk, re.IGNORECASE)
+        if m:
+            item_num = m.group(1)
+            # Clean up and take up to 2000 chars of this item's text
+            clean = re.sub(r'\s+', ' ', chunk).strip()
+            items[item_num] = clean[:2000]
+
+    return items
+
+
 def strip_html(html):
     text = re.sub(r'<[^>]+>', ' ', html)
-    text = re.sub(r'&nbsp;', ' ', text)
-    text = re.sub(r'&amp;',  '&', text)
-    text = re.sub(r'&lt;',   '<', text)
-    text = re.sub(r'&gt;',   '>', text)
-    text = re.sub(r'\s+',    ' ', text)
+    text = re.sub(r'&nbsp;',  ' ', text)
+    text = re.sub(r'&amp;',   '&', text)
+    text = re.sub(r'&lt;',    '<', text)
+    text = re.sub(r'&gt;',    '>', text)
+    text = re.sub(r'&#\d+;',  ' ', text)
+    text = re.sub(r'\s+',     ' ', text)
     return text.strip()

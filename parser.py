@@ -1,90 +1,76 @@
 """
-parser.py
-=========
-Analyzes each 8-K filing text for bullish/bearish keywords.
-Returns a scored, sorted results list.
+parser.py — analyzes 8-K filings for bullish/bearish signals + item summaries
 """
 
 from keywords import BULLISH, BEARISH, ITEM_LABELS
 
 
-def analyze_filings(filings: list) -> list:
-    """
-    Score each filing and return sorted results list.
-    Most bullish first, most bearish last.
-    """
+def analyze_filings(filings):
     results = []
 
     for i, filing in enumerate(filings, 1):
         text_lower = filing.get("text", "").lower()
-        if not text_lower:
-            continue
+        item_texts = filing.get("item_texts", {})
 
-        bullish_hits  = {}
-        bearish_hits  = {}
-        total_score   = 0
+        bullish_hits = {}
+        bearish_hits = {}
+        total_score  = 0
 
-        # Check bullish keywords
         for kw, score in BULLISH.items():
             if kw.lower() in text_lower:
                 bullish_hits[kw] = score
                 total_score += score
 
-        # Check bearish keywords
         for kw, score in BEARISH.items():
             if kw.lower() in text_lower:
                 bearish_hits[kw] = score
-                total_score += score  # score is already negative
+                total_score += score
 
-        # Determine signal
+        # Signal
         if total_score >= 15:
-            signal = "STRONG BUY"
-            color  = "#0a7c42"
+            signal, color = "STRONG BUY",       "#0a7c42"
         elif total_score >= 7:
-            signal = "BUY"
-            color  = "#1a9e56"
+            signal, color = "BUY",              "#1a9e56"
         elif total_score >= 2:
-            signal = "SLIGHTLY BULLISH"
-            color  = "#7ab648"
+            signal, color = "SLIGHTLY BULLISH", "#7ab648"
         elif total_score <= -15:
-            signal = "STRONG SELL"
-            color  = "#c0392b"
+            signal, color = "STRONG SELL",      "#c0392b"
         elif total_score <= -7:
-            signal = "SELL"
-            color  = "#e74c3c"
+            signal, color = "SELL",             "#e74c3c"
         elif total_score <= -2:
-            signal = "SLIGHTLY BEARISH"
-            color  = "#e67e22"
+            signal, color = "SLIGHTLY BEARISH", "#e67e22"
         else:
-            signal = "NEUTRAL"
-            color  = "#7f8c8d"
+            signal, color = "NEUTRAL",          "#7f8c8d"
 
-        # Resolve item labels
-        items = filing.get("items", [])
-        item_labels = []
-        for item in items:
-            item_str = str(item)
-            label = ITEM_LABELS.get(item_str, f"Item {item_str}")
-            item_labels.append(f"{item_str} — {label}")
+        # Build item summaries with labels
+        item_summaries = {}
+        for item_num in filing.get("items", []):
+            item_str   = str(item_num)
+            label      = ITEM_LABELS.get(item_str, f"Item {item_str}")
+            item_text  = item_texts.get(item_str, "")
+            item_summaries[item_str] = {
+                "label": label,
+                "text" : item_text,
+            }
 
         results.append({
-            "ticker"       : filing.get("ticker", "N/A"),
-            "company"      : filing.get("company", "Unknown"),
-            "filed_at"     : filing.get("filed_at", ""),
-            "signal"       : signal,
-            "signal_color" : color,
-            "score"        : total_score,
-            "bullish_hits" : bullish_hits,
-            "bearish_hits" : bearish_hits,
-            "items"        : item_labels,
-            "filing_url"   : filing.get("filing_url", ""),
-            "doc_url"      : filing.get("doc_url", ""),
-            "snippet"      : filing.get("text", "")[:400].strip(),
+            "ticker"        : filing.get("ticker", "N/A"),
+            "company"       : filing.get("company", "Unknown"),
+            "filed_at"      : filing.get("filed_at", ""),
+            "location"      : filing.get("location", ""),
+            "signal"        : signal,
+            "signal_color"  : color,
+            "score"         : total_score,
+            "bullish_hits"  : bullish_hits,
+            "bearish_hits"  : bearish_hits,
+            "item_summaries": item_summaries,
+            "filing_url"    : filing.get("filing_url", ""),
+            "doc_url"       : filing.get("doc_url", ""),
+            "has_text"      : bool(filing.get("text", "")),
         })
 
-        if i % 20 == 0:
+        if i % 25 == 0:
             print(f"   📊 Analyzed {i}/{len(filings)} filings...")
 
-    # Sort: most bullish first
     results.sort(key=lambda x: x["score"], reverse=True)
     return results
