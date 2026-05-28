@@ -119,7 +119,7 @@ def generate_html(results, path, today):
                 f'</div>'
             )
         else:
-            ai_summary_html = 
+            ai_summary_html = ""
         score_sign = f'+{r["score"]}' if r["score"] > 0 else str(r["score"])
 
         # ── Links ──────────────────────────────────────────────────
