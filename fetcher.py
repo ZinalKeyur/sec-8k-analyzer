@@ -1,5 +1,6 @@
 """
-fetcher.py — SEC EDGAR 8-K fetcher with robust text extraction
+fetcher.py — SEC EDGAR 8-K fetcher
+Fetches only primary 8-K documents (sequence=1, form=8-K, deduplicated by adsh)
 """
 
 import requests
@@ -16,18 +17,23 @@ EDGAR_SEARCH_URL = "https://efts.sec.gov/LATEST/search-index"
 EDGAR_BASE_URL   = "https://www.sec.gov"
 
 
-def fetch_todays_8k_filings(days_back=1, max_filings=200):
+def fetch_todays_8k_filings(days_back=1, max_filings=300):
     today     = date.today()
     from_date = (today - timedelta(days=days_back)).strftime("%Y-%m-%d")
     to_date   = today.strftime("%Y-%m-%d")
 
     print(f"   🔍 Searching EDGAR: {from_date} → {to_date}")
 
-    all_filings = []
-    start = 0
-    batch = 40
+    raw_hits   = []
+    seen_adsh  = set()
+    start      = 0
+    batch      = 40
 
-    while len(all_filings) < max_filings:
+    # We fetch more than max_filings because many hits are exhibits/duplicates
+    # We keep fetching until we have enough UNIQUE primary filings
+    fetch_limit = max_filings * 4  # fetch up to 4x to account for duplicates
+
+    while len(raw_hits) < fetch_limit:
         params = {
             "forms"    : "8-K",
             "dateRange": "custom",
@@ -50,93 +56,126 @@ def fetch_todays_8k_filings(days_back=1, max_filings=200):
         if not hits:
             break
 
-        print(f"   📥 Fetched batch {start}–{start+len(hits)} (total: {total})...")
-
+        # ── Filter: only primary 8-K documents ─────────────────────
+        # sequence=1   → primary document (not an exhibit)
+        # root_forms   → must contain exactly "8-K" (not 8-K/A amendment)
+        # adsh         → deduplicate (same filing can appear multiple times)
+        kept = 0
         for hit in hits:
-            src  = hit.get("_source", {})
-            adsh = src.get("adsh", "")
-            ciks = src.get("ciks", [])
-            cik  = ciks[0].lstrip("0") if ciks else ""
+            src        = hit.get("_source", {})
+            adsh       = src.get("adsh", "")
+            sequence   = src.get("sequence", 99)
+            root_forms = src.get("root_forms", [])
+            file_type  = src.get("file_type", "")
 
-            # ── Parse display_names string ─────────────────────────────
-            company   = "Unknown"
-            ticker    = "N/A"
-            raw_names = src.get("display_names", [])
+            # Skip if not the primary document
+            if sequence != 1:
+                continue
 
-            if raw_names:
-                name_str = raw_names[0] if isinstance(raw_names, list) else raw_names
-                m = re.match(r'^([^(]+)', name_str)
-                if m:
-                    company = m.group(1).strip()
-                all_parens = re.findall(r'\(([^)]+)\)', name_str)
-                for group in all_parens:
-                    group = group.strip()
-                    if group.upper().startswith("CIK"):
-                        continue
-                    first = group.split(",")[0].strip()
-                    if re.match(r'^[A-Z][A-Z0-9\-\.]{0,8}$', first):
-                        ticker = first
-                        break
+            # Skip if not a pure 8-K (skip 8-K/A amendments)
+            if "8-K" not in root_forms:
+                continue
+            if file_type not in ("8-K", ""):
+                continue
 
-            # ── Build filing index URL ─────────────────────────────────
-            adsh_no_dashes = adsh.replace("-", "")
-            index_url = ""
-            doc_hint  = hit.get("_id", "")   # e.g. "0000051143-26-000047:ibm-20260528.htm"
-            hint_file = doc_hint.split(":")[-1] if ":" in doc_hint else ""
+            # Skip duplicates
+            if adsh in seen_adsh:
+                continue
 
-            if cik and adsh:
-                index_url = (
-                    f"{EDGAR_BASE_URL}/Archives/edgar/data/{cik}"
-                    f"/{adsh_no_dashes}/{adsh}-index.htm"
-                )
+            seen_adsh.add(adsh)
+            raw_hits.append(hit)
+            kept += 1
 
-            filing = {
-                "ticker"    : ticker,
-                "company"   : company,
-                "cik"       : cik,
-                "filed_at"  : src.get("file_date", ""),
-                "form_type" : src.get("file_type", "8-K"),
-                "filing_url": index_url,
-                "doc_url"   : "",
-                "text"      : "",
-                "item_texts": {},
-                "items"     : src.get("items", []),
-                "location"  : src.get("biz_locations", [""])[0] if src.get("biz_locations") else "",
-            }
-
-            # Try direct document URL first using the hint from _id
-            text, doc_url = fetch_filing_text(
-                cik, adsh_no_dashes, adsh, hint_file, index_url
-            )
-            filing["text"]    = text
-            filing["doc_url"] = doc_url
-
-            # Parse item sections from text
-            if text:
-                filing["item_texts"] = extract_item_sections(text)
-
-            all_filings.append(filing)
-            time.sleep(0.1)
+        print(f"   📥 Offset {start}: {len(hits)} hits → {kept} new unique 8-K filings "
+              f"(total unique so far: {len(raw_hits)} of {total} available)")
 
         start += batch
-        if start >= total or start >= max_filings:
+        if start >= total:
             break
+
+        # Stop if we have enough unique filings
+        if len(raw_hits) >= max_filings:
+            break
+
+    print(f"\n   ✅ Total unique 8-K filings found: {len(raw_hits)}")
+
+    # ── Now enrich each unique filing ──────────────────────────────
+    all_filings = []
+    for i, hit in enumerate(raw_hits, 1):
+        filing = enrich_filing(hit)
+        all_filings.append(filing)
+        if i % 25 == 0:
+            print(f"   ⏳ Fetching text for {i}/{len(raw_hits)} filings...")
+        time.sleep(0.1)
 
     return all_filings
 
 
-def fetch_filing_text(cik, adsh_no_dashes, adsh, hint_file, index_url):
-    """
-    Try multiple strategies to get full filing text.
-    Returns (text, doc_url).
-    """
+def enrich_filing(hit):
+    src  = hit.get("_source", {})
+    adsh = src.get("adsh", "")
+    ciks = src.get("ciks", [])
+    cik  = ciks[0].lstrip("0") if ciks else ""
 
-    # Strategy 1 — use the _id hint to go directly to the primary document
-    # _id format: "0000051143-26-000047:ibm-20260528.htm"
+    # ── Company & ticker from display_names ───────────────────────
+    company   = "Unknown"
+    ticker    = "N/A"
+    raw_names = src.get("display_names", [])
+
+    if raw_names:
+        name_str = raw_names[0] if isinstance(raw_names, list) else raw_names
+        m = re.match(r'^([^(]+)', name_str)
+        if m:
+            company = m.group(1).strip()
+        for group in re.findall(r'\(([^)]+)\)', name_str):
+            group = group.strip()
+            if group.upper().startswith("CIK"):
+                continue
+            first = group.split(",")[0].strip()
+            if re.match(r'^[A-Z][A-Z0-9\-\.]{0,8}$', first):
+                ticker = first
+                break
+
+    # ── Filing URL ─────────────────────────────────────────────────
+    adsh_no_dashes = adsh.replace("-", "")
+    hint_file      = hit.get("_id", "").split(":")[-1] if ":" in hit.get("_id", "") else ""
+    index_url = ""
+    if cik and adsh:
+        index_url = (
+            f"{EDGAR_BASE_URL}/Archives/edgar/data/{cik}"
+            f"/{adsh_no_dashes}/{adsh}-index.htm"
+        )
+
+    filing = {
+        "ticker"    : ticker,
+        "company"   : company,
+        "cik"       : cik,
+        "filed_at"  : src.get("file_date", ""),
+        "form_type" : "8-K",
+        "filing_url": index_url,
+        "doc_url"   : "",
+        "text"      : "",
+        "item_texts": {},
+        "items"     : src.get("items", []),
+        "location"  : src.get("biz_locations", [""])[0] if src.get("biz_locations") else "",
+    }
+
+    # Fetch text
+    text, doc_url = fetch_filing_text(cik, adsh_no_dashes, adsh, hint_file, index_url)
+    filing["text"]    = text
+    filing["doc_url"] = doc_url
+    if text:
+        filing["item_texts"] = extract_item_sections(text)
+
+    return filing
+
+
+def fetch_filing_text(cik, adsh_no_dashes, adsh, hint_file, index_url):
+    # Strategy 1 — direct document via _id hint
     if cik and adsh_no_dashes and hint_file:
         try:
-            doc_url  = f"{EDGAR_BASE_URL}/Archives/edgar/data/{cik}/{adsh_no_dashes}/{hint_file}"
-            resp     = requests.get(doc_url, headers=HEADERS, timeout=12)
+            doc_url = f"{EDGAR_BASE_URL}/Archives/edgar/data/{cik}/{adsh_no_dashes}/{hint_file}"
+            resp    = requests.get(doc_url, headers=HEADERS, timeout=12)
             if resp.status_code == 200:
                 text = strip_html(resp.text)
                 if len(text) > 300:
@@ -144,12 +183,11 @@ def fetch_filing_text(cik, adsh_no_dashes, adsh, hint_file, index_url):
         except Exception:
             pass
 
-    # Strategy 2 — parse the index page and find primary htm document
+    # Strategy 2 — parse index page
     if index_url:
         try:
-            resp = requests.get(index_url, headers=HEADERS, timeout=10)
+            resp  = requests.get(index_url, headers=HEADERS, timeout=10)
             resp.raise_for_status()
-            # Find all .htm links, skip index files
             links = re.findall(
                 r'href="(/Archives/edgar/data/[^"]+\.htm)"',
                 resp.text, re.IGNORECASE
@@ -165,11 +203,11 @@ def fetch_filing_text(cik, adsh_no_dashes, adsh, hint_file, index_url):
         except Exception:
             pass
 
-    # Strategy 3 — full submission .txt file
+    # Strategy 3 — raw .txt submission
     if cik and adsh:
         try:
-            txt_url  = f"{EDGAR_BASE_URL}/Archives/edgar/data/{cik}/{adsh_no_dashes}/{adsh}.txt"
-            resp     = requests.get(txt_url, headers=HEADERS, timeout=12)
+            txt_url = f"{EDGAR_BASE_URL}/Archives/edgar/data/{cik}/{adsh_no_dashes}/{adsh}.txt"
+            resp    = requests.get(txt_url, headers=HEADERS, timeout=12)
             if resp.status_code == 200:
                 text = strip_html(resp.text)
                 if len(text) > 300:
@@ -181,28 +219,15 @@ def fetch_filing_text(cik, adsh_no_dashes, adsh, hint_file, index_url):
 
 
 def extract_item_sections(text):
-    """
-    Parse the filing text and extract each Item section.
-    Returns dict like:
-    {
-      "7.01": "Item 7.01. Regulation FD Disclosure. The information...",
-      "8.01": "Item 8.01. Other Events. ...",
-    }
-    """
+    """Split text into per-item sections."""
     items = {}
-
-    # Find all "Item X.XX" occurrences and split text at each
-    pattern = r'(Item\s+(\d+\.\d+)[^\n]*(?:\n|\.)[^\n]*)'
-    splits  = re.split(r'(?=Item\s+\d+\.\d+)', text, flags=re.IGNORECASE)
-
+    splits = re.split(r'(?=Item\s+\d+\.\d+)', text, flags=re.IGNORECASE)
     for chunk in splits:
         m = re.match(r'Item\s+(\d+\.\d+)', chunk, re.IGNORECASE)
         if m:
             item_num = m.group(1)
-            # Clean up and take up to 2000 chars of this item's text
-            clean = re.sub(r'\s+', ' ', chunk).strip()
+            clean    = re.sub(r'\s+', ' ', chunk).strip()
             items[item_num] = clean[:2000]
-
     return items
 
 
