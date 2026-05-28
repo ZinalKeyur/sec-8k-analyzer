@@ -6,11 +6,12 @@ Uses the free EDGAR full-text search API — no API key needed.
 """
 
 import requests
+import re
 import time
 from datetime import date, timedelta
 
 HEADERS = {
-    "User-Agent": "8K-Analyzer research@example.com",  # SEC requires a user-agent
+    "User-Agent": "8K-Analyzer research@example.com",
     "Accept-Encoding": "gzip, deflate"
 }
 
@@ -19,13 +20,6 @@ EDGAR_BASE_URL   = "https://www.sec.gov"
 
 
 def fetch_todays_8k_filings(days_back=1, max_filings=200):
-    """
-    Fetches all 8-K filings from the last N days.
-    Returns a list of dicts with filing metadata + text.
-
-    days_back=1  → today only
-    days_back=3  → last 3 days (useful for Monday to catch Friday filings)
-    """
     today     = date.today()
     from_date = (today - timedelta(days=days_back)).strftime("%Y-%m-%d")
     to_date   = today.strftime("%Y-%m-%d")
@@ -34,7 +28,7 @@ def fetch_todays_8k_filings(days_back=1, max_filings=200):
 
     all_filings = []
     start = 0
-    batch = 40  # EDGAR returns max 40 per request
+    batch = 40
 
     while len(all_filings) < max_filings:
         params = {
@@ -56,82 +50,106 @@ def fetch_todays_8k_filings(days_back=1, max_filings=200):
 
         hits = data.get("hits", {}).get("hits", [])
         if not hits:
+            print(f"   ⚠️  No hits returned at offset {start}")
             break
 
-        print(f"   📥 Fetched batch {start}–{start+len(hits)} of filings...")
+        total_available = data.get("hits", {}).get("total", {}).get("value", 0)
+        print(f"   📥 Fetched batch {start}–{start + len(hits)} (total available: {total_available})...")
 
         for hit in hits:
             src = hit.get("_source", {})
+
+            # Build the filing index URL from CIK + accession number
+            ciks         = src.get("ciks", [""])
+            cik          = ciks[0] if ciks else ""
+            accession    = hit.get("_id", "").replace("-", "")
+            file_date    = src.get("file_date", "")
+
+            # Build index URL two ways
+            index_href   = src.get("file_index_href", "")
+            if index_href:
+                index_url = EDGAR_BASE_URL + index_href
+            elif cik and accession:
+                # Standard EDGAR index URL format
+                acc_fmt   = f"{accession[:10]}-{accession[10:12]}-{accession[12:]}"
+                index_url = f"{EDGAR_BASE_URL}/Archives/edgar/data/{int(cik)}/{accession}/{acc_fmt}-index.htm"
+            else:
+                index_url = ""
+
             filing = {
-                "ticker"      : src.get("tickers", ["N/A"])[0] if src.get("tickers") else "N/A",
-                "company"     : src.get("entity_name", "Unknown"),
-                "cik"         : src.get("ciks", [""])[0] if src.get("ciks") else "",
-                "filed_at"    : src.get("file_date", ""),
-                "form_type"   : src.get("form_type", "8-K"),
-                "filing_url"  : EDGAR_BASE_URL + src.get("file_index_href", ""),
-                "doc_url"     : "",
-                "text"        : "",
-                "items"       : src.get("items", []),
+                "ticker"     : src.get("tickers", ["N/A"])[0] if src.get("tickers") else "N/A",
+                "company"    : src.get("entity_name", "Unknown"),
+                "cik"        : cik,
+                "filed_at"   : file_date,
+                "form_type"  : src.get("form_type", "8-K"),
+                "filing_url" : index_url,
+                "doc_url"    : "",
+                "text"       : "",
+                "items"      : src.get("items", []),
             }
 
-            # Fetch the actual filing text
-            text, doc_url = fetch_filing_text(src)
+            # Try to get filing text — but ALWAYS add the filing even if text fails
+            text, doc_url = fetch_filing_text(index_url, cik, accession)
             filing["text"]    = text
             filing["doc_url"] = doc_url
 
-            if text:
-                all_filings.append(filing)
+            # ✅ Always append — don't filter on text presence
+            all_filings.append(filing)
 
-            time.sleep(0.12)  # be polite to SEC servers
+            time.sleep(0.1)
 
         start += batch
-        total_available = data.get("hits", {}).get("total", {}).get("value", 0)
         if start >= total_available or start >= max_filings:
             break
 
     return all_filings
 
 
-def fetch_filing_text(source: dict) -> tuple:
+def fetch_filing_text(index_url: str, cik: str, accession: str) -> tuple:
     """
-    Given a filing source dict from EDGAR search,
-    fetch the actual document text.
-    Returns (text, doc_url).
+    Try multiple strategies to get the text of a filing.
+    Returns (text, doc_url). Returns ("", "") on failure — never crashes.
     """
-    try:
-        # Try inline text first (fastest)
-        inline = source.get("file_text") or source.get("period_of_report", "")
-        if inline and len(inline) > 200:
-            return inline, ""
+    # Strategy 1 — fetch the filing index page and find the primary document
+    if index_url:
+        try:
+            resp = requests.get(index_url, headers=HEADERS, timeout=10)
+            resp.raise_for_status()
+            html = resp.text
 
-        # Get filing index page
-        index_href = source.get("file_index_href", "")
-        if not index_href:
-            return "", ""
+            # Find primary document links (.htm files)
+            links = re.findall(r'href="(/Archives/edgar/data/[^"]+\.htm)"', html, re.IGNORECASE)
+            # Filter out index pages themselves
+            links = [l for l in links if "-index" not in l.lower()]
 
-        index_url = EDGAR_BASE_URL + index_href
-        resp = requests.get(index_url, headers=HEADERS, timeout=10)
-        resp.raise_for_status()
+            if not links:
+                # Try .txt documents
+                links = re.findall(r'href="(/Archives/edgar/data/[^"]+\.txt)"', html, re.IGNORECASE)
 
-        # Find the primary document link
-        import re
-        # Look for .htm or .txt doc links
-        matches = re.findall(r'href="(/Archives/edgar/data/[^"]+\.htm)"', resp.text, re.IGNORECASE)
-        if not matches:
-            matches = re.findall(r'href="(/Archives/edgar/data/[^"]+\.txt)"', resp.text, re.IGNORECASE)
+            if links:
+                doc_url  = EDGAR_BASE_URL + links[0]
+                doc_resp = requests.get(doc_url, headers=HEADERS, timeout=10)
+                doc_resp.raise_for_status()
+                # Strip HTML tags
+                clean = re.sub(r'<[^>]+>', ' ', doc_resp.text)
+                clean = re.sub(r'\s+', ' ', clean).strip()
+                if len(clean) > 100:
+                    return clean[:20000], doc_url
+        except Exception:
+            pass
 
-        if not matches:
-            return "", index_url
+    # Strategy 2 — try the EDGAR XBRL viewer JSON which contains filing text
+    if cik and accession:
+        try:
+            acc_fmt  = f"{accession[:10]}-{accession[10:12]}-{accession[12:]}"
+            txt_url  = f"{EDGAR_BASE_URL}/Archives/edgar/data/{int(cik)}/{accession}/{acc_fmt}.txt"
+            resp     = requests.get(txt_url, headers=HEADERS, timeout=10)
+            if resp.status_code == 200:
+                clean = re.sub(r'<[^>]+>', ' ', resp.text)
+                clean = re.sub(r'\s+', ' ', clean).strip()
+                if len(clean) > 100:
+                    return clean[:20000], txt_url
+        except Exception:
+            pass
 
-        doc_url = EDGAR_BASE_URL + matches[0]
-        doc_resp = requests.get(doc_url, headers=HEADERS, timeout=10)
-        doc_resp.raise_for_status()
-
-        # Strip HTML tags for plain text
-        clean_text = re.sub(r'<[^>]+>', ' ', doc_resp.text)
-        clean_text = re.sub(r'\s+', ' ', clean_text).strip()
-
-        return clean_text[:15000], doc_url  # cap at 15k chars per filing
-
-    except Exception:
-        return "", ""
+    return "", ""
