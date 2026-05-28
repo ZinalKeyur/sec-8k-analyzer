@@ -78,29 +78,6 @@ def generate_html(results, path, today):
 
         text_status = '<span class="no-text">⚠️ text not fetched</span>' if not r["has_text"] else ""
 
-        # ── Build Claude prompt in exact format ────────────────────
-        prompt_parts = []
-        prompt_parts.append(
-            f"Summarize this SEC 8-K filing for {r['company']} (ticker: {r['ticker']}, filed: {r['filed_at']}).\n"
-            f"Use this EXACT format for each item:\n\n"
-            f"**[Company] 8-K Summary — Item X.XX (Item Name)**\n\n"
-            f"**The big news:** [1 sentence]\n\n"
-            f"**Key facts:**\n- [fact 1]\n- [fact 2]\n- [fact 3]\n\n"
-            f"**What this really means:**\n| Aspect | Detail |\n|---|---|\n| [row] | [detail] |\n\n"
-            f"**Investment signal:** 🟢 BULLISH / 🔴 BEARISH / ⚪ NEUTRAL\n[2 sentence reason]\n\n"
-            f"---\n\n"
-        )
-        for item_num, info in r["item_summaries"].items():
-            t = info.get("text","")
-            if t:
-                prompt_parts.append(f"Item {item_num} ({info['label']}):\n{t[:1500]}\n\n")
-        if r["bullish_hits"]:
-            prompt_parts.append(f"Bullish keywords detected: {', '.join(r['bullish_hits'].keys())}\n")
-        if r["bearish_hits"]:
-            prompt_parts.append(f"Bearish keywords detected: {', '.join(r['bearish_hits'].keys())}\n")
-
-        full_prompt = "".join(prompt_parts)[:4500]
-        claude_prompt = (full_prompt
             .replace("&","&amp;").replace('"',"&quot;")
             .replace("'","&#39;").replace("<","&lt;").replace(">","&gt;"))
 
@@ -148,13 +125,7 @@ def generate_html(results, path, today):
             {detail_html}
             {ai_summary_html}
           </td>
-          <td>
-            {links}
-            <div style="margin-top:6px">
-              <button class="claude-btn" onclick="openInClaude(this)"
-                data-prompt="{claude_prompt}">🤖 Summarize in Claude</button>
-            </div>
-          </td>
+          <td>{links}</td>
         </tr>
         """
 
@@ -225,10 +196,6 @@ tbody td{{padding:8px 11px;vertical-align:top}}
 
 .no-text{{font-size:10px;color:#e67e22}}
 
-.claude-btn{{padding:4px 9px;font-size:11px;font-weight:500;
-             background:#7c3aed;color:white;border:none;
-             border-radius:6px;cursor:pointer;white-space:nowrap}}
-.claude-btn:hover{{background:#6d28d9}}
 
 .links a{{color:#3498db;text-decoration:none;margin-right:6px;font-size:11px}}
 .links a:hover{{text-decoration:underline}}
@@ -321,7 +288,7 @@ footer{{text-align:center;padding:18px;font-size:11px;color:#aaa}}
       <th>Bullish Keywords</th>
       <th>Bearish Keywords</th>
       <th>Items (click 📄 to expand)</th>
-      <th>Actions</th>
+      <th>Links</th>
     </tr>
   </thead>
   <tbody id="table-body">
@@ -412,12 +379,6 @@ function updateCount() {{
 function toggleDetail(id) {{
   const el = document.getElementById(id);
   if (el) el.style.display = el.style.display === 'block' ? 'none' : 'block';
-}}
-
-// ── Claude summarize ──────────────────────────────────────────────────────
-function openInClaude(btn) {{
-  const prompt = btn.getAttribute('data-prompt');
-  window.open('https://claude.ai/new?q=' + encodeURIComponent(prompt), '_blank');
 }}
 
 // ── Init ──────────────────────────────────────────────────────────────────
